@@ -32,16 +32,23 @@ class MainActivity : Activity() {
             startActivity(intent)
         }
 
+        // Activar: enciende el filtro (y muestra la burbuja si no estaba).
         findViewById<Button>(R.id.btnActivar).setOnClickListener {
             if (!Settings.canDrawOverlays(this)) {
                 Toast.makeText(this, R.string.falta_permiso, Toast.LENGTH_LONG).show()
             } else {
-                startForegroundService(Intent(this, OverlayService::class.java))
+                val intent = Intent(this, OverlayService::class.java)
+                    .setAction(OverlayService.ACCION_ENCENDER)
+                startForegroundService(intent)
             }
         }
 
+        // Desactivar: apaga el filtro y deja la burbuja. Si el filtro ya estaba apagado,
+        // cierra el servicio y la burbuja desaparece.
         findViewById<Button>(R.id.btnDesactivar).setOnClickListener {
-            stopService(Intent(this, OverlayService::class.java))
+            val intent = Intent(this, OverlayService::class.java)
+                .setAction(OverlayService.ACCION_APAGAR)
+            startService(intent)
         }
     }
 }

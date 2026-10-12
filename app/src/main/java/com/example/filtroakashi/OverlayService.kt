@@ -14,11 +14,15 @@ import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowManager
@@ -29,8 +33,18 @@ import android.widget.TextView
 class OverlayService : Service() {
 
     companion object {
+        // Acciones que envía la pantalla principal.
+        const val ACCION_ENCENDER = "com.example.filtroakashi.ENCENDER"
+        const val ACCION_APAGAR = "com.example.filtroakashi.APAGAR"
+
         private const val CHANNEL_ID = "filtro_akashi"
+        private const val CHANNEL_MIN_ID = "filtro_akashi_min"
         private const val NOTIF_ID = 1
+
+        // true  = con el filtro apagado la notificación desaparece del todo.
+        // false = con el filtro apagado queda una notificación mínima (sin texto).
+        // Si Android o Lenovo cierran la burbuja con el filtro apagado, pon esto en false.
+        private const val OCULTAR_NOTIFICACION_AL_APAGAR = true
 
         // Tamaño inicial: lado = fracción del ANCHO de la pantalla (sin cambios).
         private const val LADO_FRACCION = 0.7f
@@ -50,28 +64,46 @@ class OverlayService : Service() {
 
         private const val PANEL_ANCHO_DP = 280
         private const val PANEL_ALTO_DP = 130
+
+        // Burbuja flotante.
+        private const val BURBUJA_DP = 48
+        private const val CLAVE_BURBUJA_X = "burbuja_x"
+        private const val CLAVE_BURBUJA_Y = "burbuja_y"
+        private const val ALPHA_BORDE = 0.2f      // opacidad de la burbuja pegada al borde
+        private const val ZONA_BORDE_DP = 32      // a esta distancia del borde ya es 100% visible
     }
 
     private enum class Esquina { SUP_IZQ, SUP_DER, INF_IZQ, INF_DER }
 
     private lateinit var windowManager: WindowManager
+    private val handler = Handler(Looper.getMainLooper())
 
-    // Ventana 1: el cuadrado rojo (NO recibe toques).
+    // ----- Estado -----
+    private var filtroActivo = false
+    private var rectInicializado = false
+
+    // ----- Burbuja (siempre visible mientras el servicio vive) -----
+    private var burbuja: BubbleView? = null
+    private var paramsBurbuja: WindowManager.LayoutParams? = null
+    private var burbujaEnPantalla = false
+
+    // ----- Ventanas del filtro (solo mientras está activo) -----
+    // El cuadrado rojo (NO recibe toques).
     private var cuadrado: View? = null
     private var paramsCuadrado: WindowManager.LayoutParams? = null
 
-    // Ventana 2: la agarradera (SÍ recibe toques). Mueve el cuadrado entero.
+    // La agarradera (SÍ recibe toques). Mueve el cuadrado entero.
     private var agarradera: View? = null
     private var paramsAgarradera: WindowManager.LayoutParams? = null
 
-    // Ventanas 3 a 6: las cuatro pestañas de esquina (SÍ reciben toques).
+    // Las cuatro pestañas de esquina (SÍ reciben toques).
     private val pestanas = mutableMapOf<Esquina, Pair<View, WindowManager.LayoutParams>>()
 
-    // Ventana 7: ícono que abre el panel de opacidad (SÍ recibe toques).
+    // Ícono que abre el panel de opacidad (SÍ recibe toques).
     private var icono: View? = null
     private var paramsIcono: WindowManager.LayoutParams? = null
 
-    // Ventana 8: panel de opacidad, solo mientras está abierto (SÍ recibe toques).
+    // Panel de opacidad, solo mientras está abierto (SÍ recibe toques).
     private var panel: View? = null
 
     // Rectángulo actual del filtro, en píxeles de pantalla.
@@ -88,15 +120,34 @@ class OverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        crearCanales()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        iniciarEnPrimerPlano()
-        if (cuadrado == null) mostrarOverlay()
+        when (intent?.action) {
+            ACCION_APAGAR -> {
+                if (filtroActivo) {
+                    // Apaga el filtro pero deja la burbuja.
+                    desactivarFiltro()
+                    actualizarNotificacion()
+                } else {
+                    // Ya estaba apagado: cierra todo (la burbuja desaparece).
+                    stopSelf()
+                }
+            }
+            else -> {
+                // ACCION_ENCENDER (o inicio sin acción).
+                crearBurbujaSiHaceFalta()
+                if (!filtroActivo) activarFiltro()
+                actualizarNotificacion()
+            }
+        }
         return START_NOT_STICKY
     }
 
-    private fun iniciarEnPrimerPlano() {
+    // ---------- Notificación / Foreground Service ----------
+
+    private fun crearCanales() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(
             NotificationChannel(
@@ -105,16 +156,49 @@ class OverlayService : Service() {
                 NotificationManager.IMPORTANCE_LOW
             )
         )
-        val notif = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.notif_texto))
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setOngoing(true)
-            .build()
+        nm.createNotificationChannel(
+            NotificationChannel(
+                CHANNEL_MIN_ID,
+                getString(R.string.notif_canal_min),
+                NotificationManager.IMPORTANCE_MIN
+            )
+        )
+    }
 
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+    private fun entrarEnPrimerPlano(notif: Notification) {
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+        } catch (e: Exception) {
+            // Si Android no permite pasar a primer plano desde segundo plano,
+            // el filtro y la burbuja siguen funcionando, solo que sin notificación.
+        }
+    }
+
+    /**
+     * Filtro activo  -> notificación "Filtro Akashi activo" (primer plano).
+     * Filtro apagado -> sin notificación (el servicio sigue vivo sostenido por la burbuja),
+     *                   o una notificación mínima si OCULTAR_NOTIFICACION_AL_APAGAR = false.
+     */
+    private fun actualizarNotificacion() {
+        if (filtroActivo) {
+            val notif = Notification.Builder(this, CHANNEL_ID)
+                .setContentTitle(getString(R.string.notif_texto))
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setOngoing(true)
+                .build()
+            entrarEnPrimerPlano(notif)
+        } else if (OCULTAR_NOTIFICACION_AL_APAGAR) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
-            startForeground(NOTIF_ID, notif)
+            val minima = Notification.Builder(this, CHANNEL_MIN_ID)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setOngoing(true)
+                .build()
+            entrarEnPrimerPlano(minima)
         }
     }
 
@@ -156,7 +240,7 @@ class OverlayService : Service() {
 
     private fun tamanoPestana(): Int = dp(PESTANA_DP)
 
-    // ---------- Geometría ----------
+    // ---------- Geometría del filtro ----------
 
     /** Mueve el rectángulo entero a (nx, ny) conservando su tamaño, respetando límites. */
     private fun moverA(nx: Int, ny: Int) {
@@ -263,22 +347,32 @@ class OverlayService : Service() {
         }
     }
 
+    // ---------- Activar / desactivar el filtro ----------
+
     @SuppressLint("ClickableViewAccessibility")
-    private fun mostrarOverlay() {
+    private fun activarFiltro() {
+        if (filtroActivo) return
+
         // Carga la opacidad guardada (40% la primera vez).
         opacidad = getSharedPreferences(PREFS, MODE_PRIVATE)
             .getInt(CLAVE_OPACIDAD, OPACIDAD_DEFECTO)
             .coerceIn(OPACIDAD_MIN, OPACIDAD_MAX)
 
-        val lado = (resources.displayMetrics.widthPixels * LADO_FRACCION).toInt()
+        // La primera vez: centrado con el tamaño inicial de siempre.
+        // Después, mientras el servicio viva, reaparece donde lo dejaste.
+        if (!rectInicializado) {
+            val lado = (resources.displayMetrics.widthPixels * LADO_FRACCION).toInt()
+            val (w, h) = pantalla()
+            izq = (w - lado) / 2
+            arr = (h - lado) / 2
+            der = izq + lado
+            aba = arr + lado
+            moverA(izq, arr)
+            rectInicializado = true
+        }
 
-        // Posición inicial: centrado (tamaño y posición inicial sin cambios).
-        val (w, h) = pantalla()
-        izq = (w - lado) / 2
-        arr = (h - lado) / 2
-        der = izq + lado
-        aba = arr + lado
-        moverA(izq, arr)
+        // La burbuja se quita un momento para volver a ponerla al final y que quede encima.
+        quitarBurbujaDePantalla()
 
         // 1) Cuadrado rojo: no tocable.
         val vistaCuadrado = View(this).apply { setBackgroundColor(colorRojo()) }
@@ -295,7 +389,7 @@ class OverlayService : Service() {
         agarradera = vistaAgarradera
         paramsAgarradera = pa
 
-        // 3) Cuatro pestañas de esquina: tocables, encima de todo.
+        // 3) Cuatro pestañas de esquina: tocables.
         val t = tamanoPestana()
         for (e in Esquina.values()) {
             val vista = TabView(this)
@@ -314,6 +408,181 @@ class OverlayService : Service() {
         windowManager.addView(vistaIcono, pi)
         icono = vistaIcono
         paramsIcono = pi
+
+        filtroActivo = true
+        burbuja?.activo = true
+        ponerBurbujaEnPantalla()
+    }
+
+    private fun desactivarFiltro() {
+        if (!filtroActivo) return
+        ocultarPanel()
+        icono?.let { windowManager.removeView(it) }
+        cuadrado?.let { windowManager.removeView(it) }
+        agarradera?.let { windowManager.removeView(it) }
+        for ((_, par) in pestanas) windowManager.removeView(par.first)
+        pestanas.clear()
+        icono = null
+        paramsIcono = null
+        cuadrado = null
+        paramsCuadrado = null
+        agarradera = null
+        paramsAgarradera = null
+        filtroActivo = false
+        burbuja?.activo = false
+    }
+
+    private fun alternarFiltro() {
+        if (filtroActivo) desactivarFiltro() else activarFiltro()
+        actualizarNotificacion()
+    }
+
+    // ---------- Burbuja flotante ----------
+
+    private fun tamanoBurbuja(): Int = dp(BURBUJA_DP)
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun crearBurbujaSiHaceFalta() {
+        if (burbuja != null) return
+        val tam = tamanoBurbuja()
+        val (w, h) = pantalla()
+        val (barraArriba, _) = margenes()
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+
+        // Posición guardada; la primera vez: borde derecho, a un tercio de la altura.
+        val x = prefs.getInt(CLAVE_BURBUJA_X, w - tam - dp(40))
+        val y = prefs.getInt(CLAVE_BURBUJA_Y, h / 3)
+        val p = parametros(
+            x.coerceIn(0, maxOf(0, w - tam)),
+            y.coerceIn(barraArriba, maxOf(barraArriba, h - tam)),
+            tam, tam, tocable = true
+        )
+
+        val vista = BubbleView(this)
+        vista.activo = filtroActivo
+        vista.setOnTouchListener(crearListenerBurbuja())
+        burbuja = vista
+        paramsBurbuja = p
+        ponerBurbujaEnPantalla()
+    }
+
+    private fun ponerBurbujaEnPantalla() {
+        val b = burbuja ?: return
+        val p = paramsBurbuja ?: return
+        if (burbujaEnPantalla) return
+        windowManager.addView(b, p)
+        burbujaEnPantalla = true
+        actualizarAlphaBurbuja()
+    }
+
+    private fun quitarBurbujaDePantalla() {
+        val b = burbuja ?: return
+        if (!burbujaEnPantalla) return
+        windowManager.removeViewImmediate(b)
+        burbujaEnPantalla = false
+    }
+
+    // Distancia al borde más cercano -> opacidad: 20% pegada al borde, 100% a ZONA_BORDE_DP o más.
+    private fun actualizarAlphaBurbuja() {
+        val b = burbuja ?: return
+        val p = paramsBurbuja ?: return
+        val tam = tamanoBurbuja()
+        val (w, h) = pantalla()
+        val (barraArriba, _) = margenes()
+        val distancia = minOf(p.x, p.y - barraArriba, w - (p.x + tam), h - (p.y + tam))
+            .coerceAtLeast(0)
+        val fraccion = minOf(distancia.toFloat() / dp(ZONA_BORDE_DP), 1f)
+        b.alpha = ALPHA_BORDE + (1f - ALPHA_BORDE) * fraccion
+    }
+
+    private fun guardarPosicionBurbuja() {
+        val p = paramsBurbuja ?: return
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putInt(CLAVE_BURBUJA_X, p.x)
+            .putInt(CLAVE_BURBUJA_Y, p.y)
+            .apply()
+    }
+
+    private fun abrirAppPrincipal() {
+        val intent = Intent(this, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            // Si Android bloquea abrir la app desde segundo plano, simplemente no se abre.
+        }
+    }
+
+    // Toque corto: activa/desactiva el filtro. Arrastre: mueve la burbuja.
+    // Mantener presionado (sin arrastrar): abre la app principal.
+    private fun crearListenerBurbuja(): View.OnTouchListener {
+        var inicioX = 0
+        var inicioY = 0
+        var toqueX = 0f
+        var toqueY = 0f
+        var arrastrando = false
+        var largo = false
+        val umbral = ViewConfiguration.get(this).scaledTouchSlop
+
+        val alMantener = Runnable {
+            largo = true
+            burbuja?.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            abrirAppPrincipal()
+        }
+
+        return View.OnTouchListener { vista, event ->
+            val p = paramsBurbuja
+            if (p == null) {
+                false
+            } else when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    inicioX = p.x
+                    inicioY = p.y
+                    toqueX = event.rawX
+                    toqueY = event.rawY
+                    arrastrando = false
+                    largo = false
+                    vista.alpha = 1f // al tocarla vuelve a la normalidad
+                    handler.postDelayed(alMantener, ViewConfiguration.getLongPressTimeout().toLong())
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - toqueX
+                    val dy = event.rawY - toqueY
+                    if (!arrastrando && Math.hypot(dx.toDouble(), dy.toDouble()) > umbral) {
+                        arrastrando = true
+                        handler.removeCallbacks(alMantener)
+                    }
+                    if (arrastrando && !largo) {
+                        val tam = tamanoBurbuja()
+                        val (w, h) = pantalla()
+                        val (barraArriba, _) = margenes()
+                        p.x = (inicioX + dx.toInt()).coerceIn(0, maxOf(0, w - tam))
+                        p.y = (inicioY + dy.toInt()).coerceIn(barraArriba, maxOf(barraArriba, h - tam))
+                        windowManager.updateViewLayout(vista, p)
+                        actualizarAlphaBurbuja()
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    handler.removeCallbacks(alMantener)
+                    if (arrastrando) {
+                        guardarPosicionBurbuja()
+                    } else if (!largo) {
+                        // Se hace después de terminar este toque para poder reordenar ventanas.
+                        handler.post { alternarFiltro() }
+                    }
+                    actualizarAlphaBurbuja()
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    handler.removeCallbacks(alMantener)
+                    actualizarAlphaBurbuja()
+                    true
+                }
+                else -> true
+            }
+        }
     }
 
     // ---------- Panel de opacidad ----------
@@ -419,7 +688,7 @@ class OverlayService : Service() {
         return raiz
     }
 
-    // ---------- Toques ----------
+    // ---------- Toques del filtro ----------
 
     // Ícono: un toque corto abre/cierra el panel.
     private fun crearListenerIcono(): View.OnTouchListener {
@@ -553,25 +822,32 @@ class OverlayService : Service() {
         }
     }
 
-    // Al rotar: cierra el panel, conserva el rectángulo y lo ajusta a la nueva pantalla.
+    // Al rotar: cierra el panel, ajusta el filtro a la nueva pantalla y mantiene la burbuja dentro.
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        if (cuadrado == null) return
-        ocultarPanel()
-        normalizar()
-        aplicarGeometria()
+        if (panel != null) ocultarPanel()
+        if (rectInicializado) {
+            normalizar()
+            aplicarGeometria()
+        }
+        val p = paramsBurbuja
+        val b = burbuja
+        if (p != null && b != null && burbujaEnPantalla) {
+            val tam = tamanoBurbuja()
+            val (w, h) = pantalla()
+            val (barraArriba, _) = margenes()
+            p.x = p.x.coerceIn(0, maxOf(0, w - tam))
+            p.y = p.y.coerceIn(barraArriba, maxOf(barraArriba, h - tam))
+            windowManager.updateViewLayout(b, p)
+            actualizarAlphaBurbuja()
+        }
     }
 
     override fun onDestroy() {
-        ocultarPanel()
-        icono?.let { windowManager.removeView(it) }
-        cuadrado?.let { windowManager.removeView(it) }
-        agarradera?.let { windowManager.removeView(it) }
-        for ((_, par) in pestanas) windowManager.removeView(par.first)
-        pestanas.clear()
-        icono = null
-        cuadrado = null
-        agarradera = null
+        handler.removeCallbacksAndMessages(null)
+        desactivarFiltro()
+        quitarBurbujaDePantalla()
+        burbuja = null
         super.onDestroy()
     }
 }
