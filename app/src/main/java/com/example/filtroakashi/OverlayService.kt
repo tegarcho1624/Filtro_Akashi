@@ -160,9 +160,13 @@ class OverlayService : Service() {
         var toqueX = 0f
         var toqueY = 0f
 
-        return View.OnTouchListener { _, event ->
+        return View.OnTouchListener { vista, event ->
+            val h = vista as HandleView
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    h.tocada = true
+                    h.texto = "DOWN"
+                    h.invalidate()
                     inicioX = posX
                     inicioY = posY
                     toqueX = event.rawX
@@ -174,10 +178,16 @@ class OverlayService : Service() {
                     posY = inicioY + (event.rawY - toqueY).toInt()
                     limitar()
                     aplicarPosicion()
+                    h.texto = "x=$posX y=$posY"
+                    h.invalidate()
                     true
                 }
                 // Al soltar, la posición simplemente se queda donde está.
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> true
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    h.tocada = false
+                    h.invalidate()
+                    true
+                }
                 else -> false
             }
         }
