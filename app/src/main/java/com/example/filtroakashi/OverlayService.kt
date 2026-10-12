@@ -16,6 +16,7 @@ import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.WindowInsets
 import android.view.WindowManager
 
 class OverlayService : Service() {
@@ -99,10 +100,34 @@ class OverlayService : Service() {
     private fun altoAgarradera(): Int =
         (ALTO_AGARRADERA_DP * resources.displayMetrics.density).toInt()
 
+    // Devuelve (alto de la barra de estado/recorte, alto de la barra de navegación inferior).
+    private fun margenes(): Pair<Int, Int> {
+        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+        val barraRecurso = if (id > 0) resources.getDimensionPixelSize(id) else 0
+        var arriba = barraRecurso
+        var abajo = 0
+        if (Build.VERSION.SDK_INT >= 30) {
+            val ins = windowManager.maximumWindowMetrics.windowInsets
+            val sup = ins.getInsetsIgnoringVisibility(
+                WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout()
+            )
+            val inf = ins.getInsetsIgnoringVisibility(WindowInsets.Type.navigationBars())
+            arriba = maxOf(arriba, sup.top)
+            abajo = inf.bottom
+        }
+        return arriba to abajo
+    }
+
     private fun limitar() {
         val (w, h) = pantalla()
+        val (barraArriba, barraAbajo) = margenes()
         posX = posX.coerceIn(0, (w - lado).coerceAtLeast(0))
-        posY = posY.coerceIn(0, (h - lado).coerceAtLeast(0))
+
+        // La agarradera (borde superior del cuadrado) nunca debe quedar bajo la barra de estado.
+        val minY = barraArriba
+        val cabe = lado <= h - minY
+        val maxY = if (cabe) h - lado else h - altoAgarradera() - barraAbajo
+        posY = posY.coerceIn(minY, maxOf(minY, maxY))
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -123,7 +148,8 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -141,7 +167,8 @@ class OverlayService : Service() {
             altoAgarradera(),
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
