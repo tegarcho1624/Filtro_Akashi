@@ -7,4 +7,8 @@
     <string name="notif_canal">Filtro Akashi</string>
     <string name="notif_canal_min">Burbuja (silencioso)</string>
     <string name="falta_permiso">Primero da el permiso de superposición</string>
+    <string name="requiere_14">El filtro con captura requiere Android 14 o superior</string>
+    <string name="pista_captura">Elige «Una sola app» y selecciona la app de estudio</string>
+    <string name="captura_error">No se pudo iniciar la captura de pantalla</string>
+    <string name="sin_captura">Toca «Activar filtro» en la app para elegir la app a filtrar</string>
 </resources>

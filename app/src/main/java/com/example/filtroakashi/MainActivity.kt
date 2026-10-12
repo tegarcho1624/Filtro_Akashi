@@ -32,19 +32,24 @@ class MainActivity : Activity() {
             startActivity(intent)
         }
 
-        // Activar: enciende el filtro (y muestra la burbuja si no estaba).
+        // Activar: si ya hay una captura en marcha, enciende el filtro al instante;
+        // si no, abre el aviso del sistema para elegir la app que se va a filtrar.
         findViewById<Button>(R.id.btnActivar).setOnClickListener {
             if (!Settings.canDrawOverlays(this)) {
                 Toast.makeText(this, R.string.falta_permiso, Toast.LENGTH_LONG).show()
-            } else {
+            } else if (Build.VERSION.SDK_INT < 34) {
+                Toast.makeText(this, R.string.requiere_14, Toast.LENGTH_LONG).show()
+            } else if (OverlayService.capturaLista) {
                 val intent = Intent(this, OverlayService::class.java)
                     .setAction(OverlayService.ACCION_ENCENDER)
                 startForegroundService(intent)
+            } else {
+                startActivity(Intent(this, PermisoCapturaActivity::class.java))
             }
         }
 
         // Desactivar: apaga el filtro y deja la burbuja. Si el filtro ya estaba apagado,
-        // cierra el servicio y la burbuja desaparece.
+        // cierra el servicio, la captura y la burbuja.
         findViewById<Button>(R.id.btnDesactivar).setOnClickListener {
             val intent = Intent(this, OverlayService::class.java)
                 .setAction(OverlayService.ACCION_APAGAR)

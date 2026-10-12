@@ -10,9 +10,18 @@ import android.content.pm.ServiceInfo
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
+import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -21,6 +30,8 @@ import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
@@ -29,21 +40,28 @@ import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
+import android.widget.Toast
 
 class OverlayService : Service() {
 
     companion object {
-        // Acciones que envía la pantalla principal.
+        // Acciones y datos que recibe el servicio.
         const val ACCION_ENCENDER = "com.example.filtroakashi.ENCENDER"
         const val ACCION_APAGAR = "com.example.filtroakashi.APAGAR"
+        const val EXTRA_CODIGO = "codigo_captura"
+        const val EXTRA_DATOS = "datos_captura"
+
+        // true mientras hay una captura de pantalla concedida y en marcha.
+        @Volatile
+        var capturaLista = false
 
         private const val CHANNEL_ID = "filtro_akashi"
         private const val CHANNEL_MIN_ID = "filtro_akashi_min"
         private const val NOTIF_ID = 1
 
-        // true  = con el filtro apagado la notificación desaparece del todo.
-        // false = con el filtro apagado queda una notificación mínima (sin texto).
-        // Si Android o Lenovo cierran la burbuja con el filtro apagado, pon esto en false.
+        // true  = sin filtro y sin captura la notificación desaparece del todo.
+        // false = en ese caso queda una notificación mínima (sin texto).
+        // Mientras haya una captura en marcha, Android exige una notificación (mínima si el filtro está apagado).
         private const val OCULTAR_NOTIFICACION_AL_APAGAR = true
 
         // Tamaño inicial: lado = fracción del ANCHO de la pantalla (sin cambios).
@@ -55,7 +73,8 @@ class OverlayService : Service() {
         // Ancho y alto mínimos al redimensionar, en píxeles.
         private const val MIN_PX = 50
 
-        // Opacidad del rojo (#FF0000), en porcentaje.
+        // Intensidad del filtro, en porcentaje (el slider; antes "opacidad").
+        // 0% = sin filtro (blanco), 100% = rojo puro. El slider llega de 10% a 90%.
         private const val OPACIDAD_MIN = 10
         private const val OPACIDAD_MAX = 90
         private const val OPACIDAD_DEFECTO = 40
@@ -82,14 +101,49 @@ class OverlayService : Service() {
     private var filtroActivo = false
     private var rectInicializado = false
 
+    // ----- Captura de pantalla (MediaProjection, una sola app) -----
+    private var proyeccion: MediaProjection? = null
+    private var pantallaVirtual: VirtualDisplay? = null
+    private var superficie: Surface? = null
+    private var capW = 0
+    private var capH = 0
+    private var capturaVisible = true   // ¿la app capturada está a la vista?
+
+    private val callbackProyeccion = object : MediaProjection.Callback() {
+        // El usuario paró la captura, o se cerró la app capturada.
+        override fun onStop() {
+            handler.post { alPararseCaptura() }
+        }
+
+        // Cambió el tamaño del contenido capturado.
+        override fun onCapturedContentResize(width: Int, height: Int) {
+            handler.post {
+                if (width > 0 && height > 0) {
+                    capW = width
+                    capH = height
+                    pantallaVirtual?.resize(width, height, resources.displayMetrics.densityDpi)
+                    cuadrado?.surfaceTexture?.setDefaultBufferSize(width, height)
+                }
+            }
+        }
+
+        // La app capturada se ocultó o volvió a verse.
+        override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
+            handler.post {
+                capturaVisible = isVisible
+                aplicarVisibilidadFiltro()
+            }
+        }
+    }
+
     // ----- Burbuja (siempre visible mientras el servicio vive) -----
     private var burbuja: BubbleView? = null
     private var paramsBurbuja: WindowManager.LayoutParams? = null
     private var burbujaEnPantalla = false
 
     // ----- Ventanas del filtro (solo mientras está activo) -----
-    // El cuadrado rojo (NO recibe toques).
-    private var cuadrado: View? = null
+    // El área filtrada: muestra la captura con MULTIPLY (NO recibe toques).
+    private var cuadrado: TextureView? = null
     private var paramsCuadrado: WindowManager.LayoutParams? = null
 
     // La agarradera (SÍ recibe toques). Mueve el cuadrado entero.
@@ -99,11 +153,11 @@ class OverlayService : Service() {
     // Las cuatro pestañas de esquina (SÍ reciben toques).
     private val pestanas = mutableMapOf<Esquina, Pair<View, WindowManager.LayoutParams>>()
 
-    // Ícono que abre el panel de opacidad (SÍ recibe toques).
+    // Ícono que abre el panel de intensidad (SÍ recibe toques).
     private var icono: View? = null
     private var paramsIcono: WindowManager.LayoutParams? = null
 
-    // Panel de opacidad, solo mientras está abierto (SÍ recibe toques).
+    // Panel de intensidad, solo mientras está abierto (SÍ recibe toques).
     private var panel: View? = null
 
     // Rectángulo actual del filtro, en píxeles de pantalla.
@@ -112,7 +166,7 @@ class OverlayService : Service() {
     private var der = 0
     private var aba = 0
 
-    // Opacidad actual en porcentaje (10..90).
+    // Intensidad actual en porcentaje (10..90).
     private var opacidad = OPACIDAD_DEFECTO
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -127,18 +181,29 @@ class OverlayService : Service() {
         when (intent?.action) {
             ACCION_APAGAR -> {
                 if (filtroActivo) {
-                    // Apaga el filtro pero deja la burbuja.
+                    // Apaga el filtro pero deja la burbuja (y la captura en pausa).
                     desactivarFiltro()
                     actualizarNotificacion()
                 } else {
-                    // Ya estaba apagado: cierra todo (la burbuja desaparece).
+                    // Ya estaba apagado: cierra todo (captura y burbuja).
                     stopSelf()
                 }
             }
             else -> {
                 // ACCION_ENCENDER (o inicio sin acción).
                 crearBurbujaSiHaceFalta()
-                if (!filtroActivo) activarFiltro()
+                val datos = leerDatosCaptura(intent)
+
+                // startForegroundService exige entrar en primer plano enseguida.
+                entrarEnPrimerPlano(notificacionActiva(), datos != null || proyeccion != null)
+
+                if (datos != null) iniciarCaptura(intent?.getIntExtra(EXTRA_CODIGO, 0) ?: 0, datos)
+
+                if (proyeccion != null) {
+                    if (!filtroActivo) activarFiltro()
+                } else {
+                    pedirCaptura()
+                }
                 actualizarNotificacion()
             }
         }
@@ -165,41 +230,132 @@ class OverlayService : Service() {
         )
     }
 
-    private fun entrarEnPrimerPlano(notif: Notification) {
+    private fun notificacionActiva(): Notification =
+        Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.notif_texto))
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setOngoing(true)
+            .build()
+
+    private fun notificacionMinima(): Notification =
+        Notification.Builder(this, CHANNEL_MIN_ID)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setOngoing(true)
+            .build()
+
+    private fun entrarEnPrimerPlano(notif: Notification, conCaptura: Boolean) {
         try {
             if (Build.VERSION.SDK_INT >= 34) {
-                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                var tipo = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                if (conCaptura) tipo = tipo or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                startForeground(NOTIF_ID, notif, tipo)
             } else {
                 startForeground(NOTIF_ID, notif)
             }
         } catch (e: Exception) {
-            // Si Android no permite pasar a primer plano desde segundo plano,
-            // el filtro y la burbuja siguen funcionando, solo que sin notificación.
+            // Si Android no permite pasar a primer plano, el filtro y la burbuja siguen,
+            // solo que sin notificación.
         }
     }
 
     /**
-     * Filtro activo  -> notificación "Filtro Akashi activo" (primer plano).
-     * Filtro apagado -> sin notificación (el servicio sigue vivo sostenido por la burbuja),
-     *                   o una notificación mínima si OCULTAR_NOTIFICACION_AL_APAGAR = false.
+     * Filtro activo                 -> "Filtro Akashi activo".
+     * Filtro apagado, con captura   -> notificación mínima (Android la exige mientras dura la captura).
+     * Filtro apagado, sin captura   -> sin notificación (o mínima si OCULTAR_NOTIFICACION_AL_APAGAR = false).
      */
     private fun actualizarNotificacion() {
+        val conCaptura = proyeccion != null
         if (filtroActivo) {
-            val notif = Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle(getString(R.string.notif_texto))
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setOngoing(true)
-                .build()
-            entrarEnPrimerPlano(notif)
+            entrarEnPrimerPlano(notificacionActiva(), conCaptura)
+        } else if (conCaptura) {
+            entrarEnPrimerPlano(notificacionMinima(), true)
         } else if (OCULTAR_NOTIFICACION_AL_APAGAR) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
-            val minima = Notification.Builder(this, CHANNEL_MIN_ID)
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setOngoing(true)
-                .build()
-            entrarEnPrimerPlano(minima)
+            entrarEnPrimerPlano(notificacionMinima(), false)
         }
+    }
+
+    // ---------- Captura de pantalla ----------
+
+    @Suppress("DEPRECATION")
+    private fun leerDatosCaptura(intent: Intent?): Intent? {
+        if (intent == null) return null
+        return if (Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(EXTRA_DATOS, Intent::class.java)
+        } else {
+            intent.getParcelableExtra(EXTRA_DATOS)
+        }
+    }
+
+    private fun iniciarCaptura(codigo: Int, datos: Intent) {
+        limpiarCaptura(detener = true)
+        try {
+            val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val mp = mpm.getMediaProjection(codigo, datos)
+            // Android 14 exige registrar el callback antes de crear la pantalla virtual.
+            mp.registerCallback(callbackProyeccion, handler)
+
+            val (w, h) = pantalla()
+            capW = w
+            capH = h
+            capturaVisible = true
+            // Se crea sin superficie; se conecta cuando el filtro está activo (pausa/reanuda).
+            val vd = mp.createVirtualDisplay(
+                "FiltroAkashi",
+                w, h, resources.displayMetrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                null, null, handler
+            )
+            proyeccion = mp
+            pantallaVirtual = vd
+            capturaLista = true
+        } catch (e: Exception) {
+            limpiarCaptura(detener = true)
+            Toast.makeText(this, R.string.captura_error, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun limpiarCaptura(detener: Boolean) {
+        pantallaVirtual?.release()
+        pantallaVirtual = null
+        proyeccion?.let {
+            it.unregisterCallback(callbackProyeccion)
+            if (detener) it.stop()
+        }
+        proyeccion = null
+        capturaLista = false
+    }
+
+    // La captura terminó por su cuenta (el usuario la paró o se cerró la app capturada).
+    private fun alPararseCaptura() {
+        if (proyeccion == null) return
+        limpiarCaptura(detener = false)
+        if (filtroActivo) desactivarFiltro()
+        actualizarNotificacion()
+    }
+
+    private fun pedirCaptura() {
+        val intent = Intent(this, PermisoCapturaActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(this, R.string.sin_captura, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun conectarSuperficie(st: SurfaceTexture) {
+        st.setDefaultBufferSize(capW, capH)
+        val s = Surface(st)
+        superficie = s
+        pantallaVirtual?.surface = s
+    }
+
+    private fun desconectarSuperficie() {
+        pantallaVirtual?.surface = null
+        superficie?.release()
+        superficie = null
     }
 
     // ---------- Medidas de pantalla ----------
@@ -299,6 +455,7 @@ class OverlayService : Service() {
         pa.x = izq; pa.y = arr; pa.width = der - izq; pa.height = altoAgarradera()
         windowManager.updateViewLayout(c, pc)
         windowManager.updateViewLayout(a, pa)
+        actualizarTransformacion()
 
         val t = tamanoPestana()
         for ((e, par) in pestanas) {
@@ -316,11 +473,38 @@ class OverlayService : Service() {
         }
     }
 
-    // ---------- Opacidad ----------
+    // ---------- Imagen filtrada ----------
 
-    // Rojo puro #FF0000 con la opacidad elegida. Se cambia el color del fondo del cuadrado
-    // (no el alpha de la ventana), así el alpha de la ventana sigue igual que en las fases anteriores.
-    private fun colorRojo(): Int = Color.argb(opacidad * 255 / 100, 255, 0, 0)
+    // La captura es de toda la pantalla; el cuadrado solo enseña la parte que queda detrás de él.
+    // Se amplía la textura a pantalla completa y se desplaza para que coincida con la posición real.
+    private fun actualizarTransformacion() {
+        val t = cuadrado ?: return
+        val ancho = der - izq
+        val alto = aba - arr
+        if (ancho <= 0 || alto <= 0) return
+        val (w, h) = pantalla()
+        val m = Matrix()
+        m.setScale(w.toFloat() / ancho, h.toFloat() / alto)
+        m.postTranslate(-izq.toFloat(), -arr.toFloat())
+        t.setTransform(m)
+    }
+
+    // Color por el que se multiplica la captura: de blanco (sin filtro) a rojo puro (filtro completo).
+    private fun colorFiltro(): Int {
+        val verdeAzul = 255 * (100 - opacidad) / 100
+        return Color.rgb(255, verdeAzul, verdeAzul)
+    }
+
+    private fun aplicarColorFiltro() {
+        val paint = Paint().apply {
+            colorFilter = PorterDuffColorFilter(colorFiltro(), PorterDuff.Mode.MULTIPLY)
+        }
+        cuadrado?.setLayerPaint(paint)
+    }
+
+    private fun aplicarVisibilidadFiltro() {
+        cuadrado?.visibility = if (capturaVisible) View.VISIBLE else View.INVISIBLE
+    }
 
     private fun guardarOpacidad() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(CLAVE_OPACIDAD, opacidad).apply()
@@ -328,12 +512,15 @@ class OverlayService : Service() {
 
     // ---------- Ventanas ----------
 
-    private fun parametros(x: Int, y: Int, ancho: Int, alto: Int, tocable: Boolean):
-        WindowManager.LayoutParams {
+    private fun parametros(
+        x: Int, y: Int, ancho: Int, alto: Int, tocable: Boolean, aceleracion: Boolean = false
+    ): WindowManager.LayoutParams {
         var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
         if (!tocable) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        // El TextureView necesita aceleración por hardware.
+        if (aceleracion) flags = flags or WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
         return WindowManager.LayoutParams(
             ancho,
             alto,
@@ -352,8 +539,13 @@ class OverlayService : Service() {
     @SuppressLint("ClickableViewAccessibility")
     private fun activarFiltro() {
         if (filtroActivo) return
+        // Sin captura no hay nada que filtrar.
+        if (proyeccion == null) {
+            pedirCaptura()
+            return
+        }
 
-        // Carga la opacidad guardada (40% la primera vez).
+        // Carga la intensidad guardada (40% la primera vez).
         opacidad = getSharedPreferences(PREFS, MODE_PRIVATE)
             .getInt(CLAVE_OPACIDAD, OPACIDAD_DEFECTO)
             .coerceIn(OPACIDAD_MIN, OPACIDAD_MAX)
@@ -374,14 +566,35 @@ class OverlayService : Service() {
         // La burbuja se quita un momento para volver a ponerla al final y que quede encima.
         quitarBurbujaDePantalla()
 
-        // 1) Cuadrado rojo: no tocable.
-        val vistaCuadrado = View(this).apply { setBackgroundColor(colorRojo()) }
-        val pc = parametros(izq, arr, der - izq, aba - arr, tocable = false)
-        windowManager.addView(vistaCuadrado, pc)
-        cuadrado = vistaCuadrado
-        paramsCuadrado = pc
+        // 1) Área filtrada: la captura multiplicada por el color; no tocable.
+        val textura = TextureView(this).apply {
+            isOpaque = true
+            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                    conectarSuperficie(st)
+                }
 
-        // 2) Agarradera: tocable, encima del cuadrado.
+                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+
+                override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                    desconectarSuperficie()
+                    return true
+                }
+
+                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+            }
+        }
+        val pc = parametros(
+            izq, arr, der - izq, aba - arr, tocable = false, aceleracion = true
+        )
+        windowManager.addView(textura, pc)
+        cuadrado = textura
+        paramsCuadrado = pc
+        aplicarColorFiltro()
+        aplicarVisibilidadFiltro()
+        actualizarTransformacion()
+
+        // 2) Agarradera: tocable, encima del área filtrada.
         val vistaAgarradera = HandleView(this)
         val pa = parametros(izq, arr, der - izq, altoAgarradera(), tocable = true)
         vistaAgarradera.setOnTouchListener(crearListenerArrastre())
@@ -400,7 +613,7 @@ class OverlayService : Service() {
             pestanas[e] = vista to p
         }
 
-        // 4) Ícono que abre el panel de opacidad.
+        // 4) Ícono que abre el panel de intensidad.
         val vistaIcono = IconView(this)
         val (ix, iy) = posicionIcono()
         val pi = parametros(ix, iy, t, t, tocable = true)
@@ -418,6 +631,7 @@ class OverlayService : Service() {
         if (!filtroActivo) return
         ocultarPanel()
         icono?.let { windowManager.removeView(it) }
+        // Al quitar el área filtrada, la superficie se desconecta y la captura queda en pausa.
         cuadrado?.let { windowManager.removeView(it) }
         agarradera?.let { windowManager.removeView(it) }
         for ((_, par) in pestanas) windowManager.removeView(par.first)
@@ -433,7 +647,15 @@ class OverlayService : Service() {
     }
 
     private fun alternarFiltro() {
-        if (filtroActivo) desactivarFiltro() else activarFiltro()
+        if (filtroActivo) {
+            desactivarFiltro()
+        } else if (proyeccion != null) {
+            activarFiltro()
+        } else {
+            // La captura terminó: hace falta volver a elegir la app.
+            pedirCaptura()
+            return
+        }
         actualizarNotificacion()
     }
 
@@ -585,7 +807,7 @@ class OverlayService : Service() {
         }
     }
 
-    // ---------- Panel de opacidad ----------
+    // ---------- Panel de intensidad ----------
 
     private fun alternarPanel() {
         if (panel == null) mostrarPanel() else ocultarPanel()
@@ -629,7 +851,7 @@ class OverlayService : Service() {
         }
 
         val titulo = TextView(this).apply {
-            text = "Opacidad"
+            text = "Intensidad"
             setTextColor(Color.WHITE)
             textSize = 14f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
@@ -668,7 +890,7 @@ class OverlayService : Service() {
                     opacidad = OPACIDAD_MIN + progreso
                     valor.text = "$opacidad%"
                     // Cambio en tiempo real, sin reiniciar el filtro.
-                    cuadrado?.setBackgroundColor(colorRojo())
+                    aplicarColorFiltro()
                     if (delUsuario) guardarOpacidad()
                 }
 
@@ -846,6 +1068,7 @@ class OverlayService : Service() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         desactivarFiltro()
+        limpiarCaptura(detener = true)
         quitarBurbujaDePantalla()
         burbuja = null
         super.onDestroy()
