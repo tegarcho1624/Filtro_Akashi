@@ -25,15 +25,20 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "filtro_akashi"
         private const val NOTIF_ID = 1
 
-        // Lado del cuadrado como fracción del ANCHO de la pantalla (sin cambios).
+        // Tamaño inicial: lado = fracción del ANCHO de la pantalla (sin cambios).
         private const val LADO_FRACCION = 0.7f
 
         // Rojo puro #FF0000 al 40% de opacidad -> alfa 0.40 * 255 = 102 = 0x66 (sin cambios).
         private val COLOR = Color.argb(102, 255, 0, 0)
 
-        // Alto de la agarradera en dp.
         private const val ALTO_AGARRADERA_DP = 40
+        private const val PESTANA_DP = 36
+
+        // Ancho y alto mínimos al redimensionar, en píxeles.
+        private const val MIN_PX = 50
     }
+
+    private enum class Esquina { SUP_IZQ, SUP_DER, INF_IZQ, INF_DER }
 
     private lateinit var windowManager: WindowManager
 
@@ -41,14 +46,18 @@ class OverlayService : Service() {
     private var cuadrado: View? = null
     private var paramsCuadrado: WindowManager.LayoutParams? = null
 
-    // Ventana 2: la agarradera (SÍ recibe toques). Android aplica FLAG_NOT_TOUCHABLE
-    // por ventana, no por zona, por eso son dos ventanas.
+    // Ventana 2: la agarradera (SÍ recibe toques). Mueve el cuadrado entero.
     private var agarradera: View? = null
     private var paramsAgarradera: WindowManager.LayoutParams? = null
 
-    private var lado = 0
-    private var posX = 0
-    private var posY = 0
+    // Ventanas 3 a 6: las cuatro pestañas de esquina (SÍ reciben toques).
+    private val pestanas = mutableMapOf<Esquina, Pair<View, WindowManager.LayoutParams>>()
+
+    // Rectángulo actual del filtro, en píxeles de pantalla.
+    private var izq = 0
+    private var arr = 0
+    private var der = 0
+    private var aba = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -85,6 +94,8 @@ class OverlayService : Service() {
         }
     }
 
+    // ---------- Medidas de pantalla ----------
+
     private fun pantalla(): Pair<Int, Int> {
         return if (Build.VERSION.SDK_INT >= 30) {
             val b = windowManager.maximumWindowMetrics.bounds
@@ -97,10 +108,7 @@ class OverlayService : Service() {
         }
     }
 
-    private fun altoAgarradera(): Int =
-        (ALTO_AGARRADERA_DP * resources.displayMetrics.density).toInt()
-
-    // Devuelve (alto de la barra de estado/recorte, alto de la barra de navegación inferior).
+    // (alto de la barra de estado/recorte, alto de la barra de navegación inferior)
     private fun margenes(): Pair<Int, Int> {
         val id = resources.getIdentifier("status_bar_height", "dimen", "android")
         val barraRecurso = if (id > 0) resources.getDimensionPixelSize(id) else 0
@@ -118,69 +126,134 @@ class OverlayService : Service() {
         return arriba to abajo
     }
 
-    private fun limitar() {
+    private fun altoAgarradera(): Int =
+        (ALTO_AGARRADERA_DP * resources.displayMetrics.density).toInt()
+
+    private fun tamanoPestana(): Int =
+        (PESTANA_DP * resources.displayMetrics.density).toInt()
+
+    // ---------- Geometría ----------
+
+    /** Mueve el rectángulo entero a (nx, ny) conservando su tamaño, respetando límites. */
+    private fun moverA(nx: Int, ny: Int) {
+        val ancho = der - izq
+        val alto = aba - arr
         val (w, h) = pantalla()
         val (barraArriba, barraAbajo) = margenes()
-        posX = posX.coerceIn(0, (w - lado).coerceAtLeast(0))
 
-        // La agarradera (borde superior del cuadrado) nunca debe quedar bajo la barra de estado.
-        val minY = barraArriba
-        val cabe = lado <= h - minY
-        val maxY = if (cabe) h - lado else h - altoAgarradera() - barraAbajo
-        posY = posY.coerceIn(minY, maxOf(minY, maxY))
+        val x = nx.coerceIn(0, maxOf(0, w - ancho))
+        // La agarradera nunca queda bajo la barra de estado.
+        val cabe = alto <= h - barraArriba
+        val maxY = if (cabe) h - alto else h - altoAgarradera() - barraAbajo
+        val y = ny.coerceIn(barraArriba, maxOf(barraArriba, maxY))
+
+        izq = x; arr = y; der = x + ancho; aba = y + alto
+    }
+
+    /** Mete el rectángulo dentro de la pantalla (lo encoge si hace falta). */
+    private fun normalizar() {
+        val (w, h) = pantalla()
+        val (barraArriba, _) = margenes()
+        izq = izq.coerceIn(0, w - MIN_PX)
+        arr = arr.coerceIn(barraArriba, h - MIN_PX)
+        der = der.coerceIn(izq + MIN_PX, w)
+        aba = aba.coerceIn(arr + MIN_PX, h)
+    }
+
+    private fun posicionPestana(e: Esquina): Pair<Int, Int> {
+        val t = tamanoPestana()
+        val (barraArriba, _) = margenes()
+        val (x, y) = when (e) {
+            Esquina.SUP_IZQ -> izq to arr
+            Esquina.SUP_DER -> (der - t) to arr
+            Esquina.INF_IZQ -> izq to (aba - t)
+            Esquina.INF_DER -> (der - t) to (aba - t)
+        }
+        return x.coerceAtLeast(0) to y.coerceAtLeast(barraArriba)
+    }
+
+    private fun aplicarGeometria() {
+        val c = cuadrado ?: return
+        val pc = paramsCuadrado ?: return
+        val a = agarradera ?: return
+        val pa = paramsAgarradera ?: return
+
+        pc.x = izq; pc.y = arr; pc.width = der - izq; pc.height = aba - arr
+        pa.x = izq; pa.y = arr; pa.width = der - izq; pa.height = altoAgarradera()
+        windowManager.updateViewLayout(c, pc)
+        windowManager.updateViewLayout(a, pa)
+
+        val t = tamanoPestana()
+        for ((e, par) in pestanas) {
+            val (x, y) = posicionPestana(e)
+            par.second.x = x; par.second.y = y; par.second.width = t; par.second.height = t
+            windowManager.updateViewLayout(par.first, par.second)
+        }
+    }
+
+    // ---------- Ventanas ----------
+
+    private fun parametros(x: Int, y: Int, ancho: Int, alto: Int, tocable: Boolean):
+        WindowManager.LayoutParams {
+        var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        if (!tocable) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        return WindowManager.LayoutParams(
+            ancho,
+            alto,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            flags,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            this.x = x
+            this.y = y
+        }
     }
 
     @SuppressLint("ClickableViewAccessibility")
     private fun mostrarOverlay() {
-        lado = (resources.displayMetrics.widthPixels * LADO_FRACCION).toInt()
+        val lado = (resources.displayMetrics.widthPixels * LADO_FRACCION).toInt()
 
-        // Posición inicial: centrado.
+        // Posición inicial: centrado (tamaño y posición inicial sin cambios).
         val (w, h) = pantalla()
-        posX = (w - lado) / 2
-        posY = (h - lado) / 2
-        limitar()
+        izq = (w - lado) / 2
+        arr = (h - lado) / 2
+        der = izq + lado
+        aba = arr + lado
+        moverA(izq, arr)
 
-        // --- Cuadrado rojo: no tocable ---
+        // 1) Cuadrado rojo: no tocable.
         val vistaCuadrado = View(this).apply { setBackgroundColor(COLOR) }
-        val pc = WindowManager.LayoutParams(
-            lado,
-            lado,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = posX
-            y = posY
-        }
+        val pc = parametros(izq, arr, der - izq, aba - arr, tocable = false)
         windowManager.addView(vistaCuadrado, pc)
         cuadrado = vistaCuadrado
         paramsCuadrado = pc
 
-        // --- Agarradera: tocable, se añade después para quedar encima ---
+        // 2) Agarradera: tocable, encima del cuadrado.
         val vistaAgarradera = HandleView(this)
-        val pa = WindowManager.LayoutParams(
-            lado,
-            altoAgarradera(),
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = posX
-            y = posY
-        }
+        val pa = parametros(izq, arr, der - izq, altoAgarradera(), tocable = true)
         vistaAgarradera.setOnTouchListener(crearListenerArrastre())
         windowManager.addView(vistaAgarradera, pa)
         agarradera = vistaAgarradera
         paramsAgarradera = pa
+
+        // 3) Cuatro pestañas de esquina: tocables, encima de todo.
+        val t = tamanoPestana()
+        for (e in Esquina.values()) {
+            val vista = TabView(this)
+            val (x, y) = posicionPestana(e)
+            val p = parametros(x, y, t, t, tocable = true)
+            vista.setOnTouchListener(crearListenerEsquina(e))
+            windowManager.addView(vista, p)
+            pestanas[e] = vista to p
+        }
     }
 
+    // ---------- Toques ----------
+
+    // Agarradera: mueve el cuadrado entero sin cambiar su tamaño (comportamiento igual que antes).
     private fun crearListenerArrastre(): View.OnTouchListener {
         var inicioX = 0
         var inicioY = 0
@@ -194,22 +267,22 @@ class OverlayService : Service() {
                     h.tocada = true
                     h.texto = "DOWN"
                     h.invalidate()
-                    inicioX = posX
-                    inicioY = posY
+                    inicioX = izq
+                    inicioY = arr
                     toqueX = event.rawX
                     toqueY = event.rawY
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    posX = inicioX + (event.rawX - toqueX).toInt()
-                    posY = inicioY + (event.rawY - toqueY).toInt()
-                    limitar()
-                    aplicarPosicion()
-                    h.texto = "x=$posX y=$posY"
+                    moverA(
+                        inicioX + (event.rawX - toqueX).toInt(),
+                        inicioY + (event.rawY - toqueY).toInt()
+                    )
+                    aplicarGeometria()
+                    h.texto = "x=$izq y=$arr"
                     h.invalidate()
                     true
                 }
-                // Al soltar, la posición simplemente se queda donde está.
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     h.tocada = false
                     h.invalidate()
@@ -220,34 +293,83 @@ class OverlayService : Service() {
         }
     }
 
-    private fun aplicarPosicion() {
-        val c = cuadrado
-        val pc = paramsCuadrado
-        val a = agarradera
-        val pa = paramsAgarradera
-        if (c != null && pc != null && a != null && pa != null) {
-            pc.x = posX; pc.y = posY
-            pa.x = posX; pa.y = posY
-            windowManager.updateViewLayout(c, pc)
-            windowManager.updateViewLayout(a, pa)
+    // Pestañas: mueven su esquina; la esquina opuesta queda fija.
+    private fun crearListenerEsquina(esquina: Esquina): View.OnTouchListener {
+        var sIzq = 0
+        var sArr = 0
+        var sDer = 0
+        var sAba = 0
+        var toqueX = 0f
+        var toqueY = 0f
+        var anchoPantalla = 0
+        var altoPantalla = 0
+        var minY = 0
+
+        return View.OnTouchListener { vista, event ->
+            val tab = vista as TabView
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    tab.tocada = true
+                    tab.invalidate()
+                    // Si el cuadrado inicial no cabía en pantalla, se ajusta al primer toque.
+                    normalizar()
+                    aplicarGeometria()
+                    val (w, h) = pantalla()
+                    anchoPantalla = w
+                    altoPantalla = h
+                    minY = margenes().first
+                    sIzq = izq; sArr = arr; sDer = der; sAba = aba
+                    toqueX = event.rawX
+                    toqueY = event.rawY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (event.rawX - toqueX).toInt()
+                    val dy = (event.rawY - toqueY).toInt()
+                    when (esquina) {
+                        Esquina.SUP_IZQ -> {
+                            izq = (sIzq + dx).coerceIn(0, sDer - MIN_PX)
+                            arr = (sArr + dy).coerceIn(minY, sAba - MIN_PX)
+                        }
+                        Esquina.SUP_DER -> {
+                            der = (sDer + dx).coerceIn(sIzq + MIN_PX, anchoPantalla)
+                            arr = (sArr + dy).coerceIn(minY, sAba - MIN_PX)
+                        }
+                        Esquina.INF_IZQ -> {
+                            izq = (sIzq + dx).coerceIn(0, sDer - MIN_PX)
+                            aba = (sAba + dy).coerceIn(sArr + MIN_PX, altoPantalla)
+                        }
+                        Esquina.INF_DER -> {
+                            der = (sDer + dx).coerceIn(sIzq + MIN_PX, anchoPantalla)
+                            aba = (sAba + dy).coerceIn(sArr + MIN_PX, altoPantalla)
+                        }
+                    }
+                    aplicarGeometria()
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    tab.tocada = false
+                    tab.invalidate()
+                    true
+                }
+                else -> false
+            }
         }
     }
 
-    // Al rotar: recalcula tamaño, mantiene la posición dentro de los límites.
+    // Al rotar: conserva el rectángulo y lo ajusta a la nueva pantalla.
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        val pc = paramsCuadrado ?: return
-        val pa = paramsAgarradera ?: return
-        lado = (resources.displayMetrics.widthPixels * LADO_FRACCION).toInt()
-        pc.width = lado; pc.height = lado
-        pa.width = lado; pa.height = altoAgarradera()
-        limitar()
-        aplicarPosicion()
+        if (cuadrado == null) return
+        normalizar()
+        aplicarGeometria()
     }
 
     override fun onDestroy() {
         cuadrado?.let { windowManager.removeView(it) }
         agarradera?.let { windowManager.removeView(it) }
+        for ((_, par) in pestanas) windowManager.removeView(par.first)
+        pestanas.clear()
         cuadrado = null
         agarradera = null
         super.onDestroy()
