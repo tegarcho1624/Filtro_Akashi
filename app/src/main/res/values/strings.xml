@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">Filtro Akashi</string>
+    <string name="activar_filtro">Activar filtro</string>
+    <string name="desactivar_filtro">Desactivar filtro</string>
+    <string name="dar_permiso">Dar permiso de superposición</string>
+    <string name="notif_texto">Filtro Akashi activo</string>
+    <string name="notif_canal">Filtro Akashi</string>
+    <string name="falta_permiso">Primero da el permiso de superposición</string>
+</resources>
