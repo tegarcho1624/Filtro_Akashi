@@ -1,5 +1,6 @@
 package com.example.filtroakashi
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -11,7 +12,9 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
+import android.util.DisplayMetrics
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 
@@ -21,15 +24,30 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "filtro_akashi"
         private const val NOTIF_ID = 1
 
-        // Lado del cuadrado como fracción del ANCHO de la pantalla. Cámbialo a tu gusto.
+        // Lado del cuadrado como fracción del ANCHO de la pantalla (sin cambios).
         private const val LADO_FRACCION = 0.7f
 
-        // Rojo puro #FF0000 al 40% de opacidad -> alfa 0.40 * 255 = 102 = 0x66.
+        // Rojo puro #FF0000 al 40% de opacidad -> alfa 0.40 * 255 = 102 = 0x66 (sin cambios).
         private val COLOR = Color.argb(102, 255, 0, 0)
+
+        // Alto de la agarradera en dp.
+        private const val ALTO_AGARRADERA_DP = 40
     }
 
     private lateinit var windowManager: WindowManager
-    private var overlay: View? = null
+
+    // Ventana 1: el cuadrado rojo (NO recibe toques).
+    private var cuadrado: View? = null
+    private var paramsCuadrado: WindowManager.LayoutParams? = null
+
+    // Ventana 2: la agarradera (SÍ recibe toques). Android aplica FLAG_NOT_TOUCHABLE
+    // por ventana, no por zona, por eso son dos ventanas.
+    private var agarradera: View? = null
+    private var paramsAgarradera: WindowManager.LayoutParams? = null
+
+    private var lado = 0
+    private var posX = 0
+    private var posY = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -40,7 +58,7 @@ class OverlayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         iniciarEnPrimerPlano()
-        if (overlay == null) mostrarOverlay()
+        if (cuadrado == null) mostrarOverlay()
         return START_NOT_STICKY
     }
 
@@ -66,15 +84,40 @@ class OverlayService : Service() {
         }
     }
 
-    private fun mostrarOverlay() {
-        val view = View(this).apply { setBackgroundColor(COLOR) }
-        windowManager.addView(view, crearParametros())
-        overlay = view
+    private fun pantalla(): Pair<Int, Int> {
+        return if (Build.VERSION.SDK_INT >= 30) {
+            val b = windowManager.maximumWindowMetrics.bounds
+            b.width() to b.height()
+        } else {
+            val m = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(m)
+            m.widthPixels to m.heightPixels
+        }
     }
 
-    private fun crearParametros(): WindowManager.LayoutParams {
-        val lado = (resources.displayMetrics.widthPixels * LADO_FRACCION).toInt()
-        return WindowManager.LayoutParams(
+    private fun altoAgarradera(): Int =
+        (ALTO_AGARRADERA_DP * resources.displayMetrics.density).toInt()
+
+    private fun limitar() {
+        val (w, h) = pantalla()
+        posX = posX.coerceIn(0, (w - lado).coerceAtLeast(0))
+        posY = posY.coerceIn(0, (h - lado).coerceAtLeast(0))
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun mostrarOverlay() {
+        lado = (resources.displayMetrics.widthPixels * LADO_FRACCION).toInt()
+
+        // Posición inicial: centrado.
+        val (w, h) = pantalla()
+        posX = (w - lado) / 2
+        posY = (h - lado) / 2
+        limitar()
+
+        // --- Cuadrado rojo: no tocable ---
+        val vistaCuadrado = View(this).apply { setBackgroundColor(COLOR) }
+        val pc = WindowManager.LayoutParams(
             lado,
             lado,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -82,18 +125,94 @@ class OverlayService : Service() {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.CENTER }
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = posX
+            y = posY
+        }
+        windowManager.addView(vistaCuadrado, pc)
+        cuadrado = vistaCuadrado
+        paramsCuadrado = pc
+
+        // --- Agarradera: tocable, se añade después para quedar encima ---
+        val vistaAgarradera = HandleView(this)
+        val pa = WindowManager.LayoutParams(
+            lado,
+            altoAgarradera(),
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = posX
+            y = posY
+        }
+        vistaAgarradera.setOnTouchListener(crearListenerArrastre())
+        windowManager.addView(vistaAgarradera, pa)
+        agarradera = vistaAgarradera
+        paramsAgarradera = pa
     }
 
-    // Si se rota la pantalla, recalcula el tamaño para mantenerlo centrado y proporcionado.
+    private fun crearListenerArrastre(): View.OnTouchListener {
+        var inicioX = 0
+        var inicioY = 0
+        var toqueX = 0f
+        var toqueY = 0f
+
+        return View.OnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    inicioX = posX
+                    inicioY = posY
+                    toqueX = event.rawX
+                    toqueY = event.rawY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    posX = inicioX + (event.rawX - toqueX).toInt()
+                    posY = inicioY + (event.rawY - toqueY).toInt()
+                    limitar()
+                    aplicarPosicion()
+                    true
+                }
+                // Al soltar, la posición simplemente se queda donde está.
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> true
+                else -> false
+            }
+        }
+    }
+
+    private fun aplicarPosicion() {
+        val c = cuadrado
+        val pc = paramsCuadrado
+        val a = agarradera
+        val pa = paramsAgarradera
+        if (c != null && pc != null && a != null && pa != null) {
+            pc.x = posX; pc.y = posY
+            pa.x = posX; pa.y = posY
+            windowManager.updateViewLayout(c, pc)
+            windowManager.updateViewLayout(a, pa)
+        }
+    }
+
+    // Al rotar: recalcula tamaño, mantiene la posición dentro de los límites.
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        overlay?.let { windowManager.updateViewLayout(it, crearParametros()) }
+        val pc = paramsCuadrado ?: return
+        val pa = paramsAgarradera ?: return
+        lado = (resources.displayMetrics.widthPixels * LADO_FRACCION).toInt()
+        pc.width = lado; pc.height = lado
+        pa.width = lado; pa.height = altoAgarradera()
+        limitar()
+        aplicarPosicion()
     }
 
     override fun onDestroy() {
-        overlay?.let { windowManager.removeView(it) }
-        overlay = null
+        cuadrado?.let { windowManager.removeView(it) }
+        agarradera?.let { windowManager.removeView(it) }
+        cuadrado = null
+        agarradera = null
         super.onDestroy()
     }
 }
